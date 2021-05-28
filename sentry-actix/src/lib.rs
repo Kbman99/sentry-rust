@@ -70,7 +70,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
-use actix_web::Error;
 use futures_util::future::{ok, Future, Ready};
 use futures_util::FutureExt;
 
@@ -150,14 +149,13 @@ impl Default for Sentry {
     }
 }
 
-impl<S, B> Transform<S> for Sentry
+impl<S, B> Transform<S, ServiceRequest> for Sentry
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>,
     S::Future: 'static,
 {
-    type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
-    type Error = Error;
+    type Error = actix_web::Error;
     type Transform = SentryMiddleware<S>;
     type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
@@ -176,24 +174,23 @@ pub struct SentryMiddleware<S> {
     inner: Sentry,
 }
 
-impl<S, B> Service for SentryMiddleware<S>
+impl<S, B> Service<ServiceRequest> for SentryMiddleware<S>
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = actix_web::Error>,
     S::Future: 'static,
 {
-    type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
-    type Error = Error;
+    type Error = actix_web::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 
     fn poll_ready(
-        &mut self,
+        &self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+    fn call(&self, req: ServiceRequest) -> Self::Future {
         let inner = self.inner.clone();
         let hub = Arc::new(Hub::new_from_top(
             inner.hub.clone().unwrap_or_else(Hub::main),
@@ -349,7 +346,7 @@ mod tests {
                     HttpResponse::Ok()
                 };
 
-                let mut app = init_service(
+                let app = init_service(
                     App::new()
                         .wrap(Sentry::builder().with_hub(Hub::current()).finish())
                         .service(web::resource("/test").to(service)),
@@ -359,7 +356,7 @@ mod tests {
                 // Call the service twice (sequentially) to ensure the middleware isn't sticky
                 for _ in 0..2 {
                     let req = TestRequest::get().uri("/test").to_request();
-                    let res = call_service(&mut app, req).await;
+                    let res = call_service(&app, req).await;
                     assert!(res.status().is_success());
                 }
             })
@@ -381,14 +378,14 @@ mod tests {
         let events = sentry::test::with_captured_events(|| {
             block_on(async {
                 #[get("/test")]
-                async fn failing(_req: HttpRequest) -> Result<String, Error> {
+                async fn failing(_req: HttpRequest) -> Result<String, actix_web::Error> {
                     // Current hub should have no events
                     _assert_hub_no_events();
 
                     Err(io::Error::new(io::ErrorKind::Other, "Test Error").into())
                 }
 
-                let mut app = init_service(
+                let app = init_service(
                     App::new()
                         .wrap(Sentry::builder().with_hub(Hub::current()).finish())
                         .service(failing),
@@ -398,7 +395,7 @@ mod tests {
                 // Call the service twice (sequentially) to ensure the middleware isn't sticky
                 for _ in 0..2 {
                     let req = TestRequest::get().uri("/test").to_request();
-                    let res = call_service(&mut app, req).await;
+                    let res = call_service(&app, req).await;
                     assert!(res.status().is_server_error());
                 }
             })
@@ -423,7 +420,7 @@ mod tests {
             block_on(async {
                 let service = || HttpResponse::NotFound();
 
-                let mut app = init_service(
+                let app = init_service(
                     App::new()
                         .wrap(Sentry::builder().with_hub(Hub::current()).finish())
                         .service(web::resource("/test").to(service)),
@@ -431,7 +428,7 @@ mod tests {
                 .await;
 
                 let req = TestRequest::get().uri("/test").to_request();
-                let res = call_service(&mut app, req).await;
+                let res = call_service(&app, req).await;
                 assert!(res.status().is_client_error());
             })
         });
@@ -445,13 +442,15 @@ mod tests {
         let events = sentry::test::with_captured_events(|| {
             block_on(async {
                 #[get("/test")]
-                async fn original_transaction(_req: HttpRequest) -> Result<String, Error> {
+                async fn original_transaction(
+                    _req: HttpRequest,
+                ) -> Result<String, actix_web::Error> {
                     // Override transaction name
                     sentry::configure_scope(|scope| scope.set_transaction(Some("new_transaction")));
                     Err(io::Error::new(io::ErrorKind::Other, "Test Error").into())
                 }
 
-                let mut app = init_service(
+                let app = init_service(
                     App::new()
                         .wrap(Sentry::builder().with_hub(Hub::current()).finish())
                         .service(original_transaction),
@@ -459,7 +458,7 @@ mod tests {
                 .await;
 
                 let req = TestRequest::get().uri("/test").to_request();
-                let res = call_service(&mut app, req).await;
+                let res = call_service(&app, req).await;
                 assert!(res.status().is_server_error());
             })
         });
@@ -487,11 +486,11 @@ mod tests {
 
                     let middleware = Sentry::builder().with_hub(Hub::current()).finish();
 
-                    let mut app = init_service(App::new().wrap(middleware).service(hello)).await;
+                    let app = init_service(App::new().wrap(middleware).service(hello)).await;
 
                     for _ in 0..5 {
                         let req = TestRequest::get().uri("/").to_request();
-                        call_service(&mut app, req).await;
+                        call_service(&app, req).await;
                     }
                 })
             },
